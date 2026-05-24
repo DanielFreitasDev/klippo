@@ -8,6 +8,8 @@
 //! tokens *before* substitution, so a clipboard value containing `;`, `&&`,
 //! spaces, etc. lands in a single argv slot and cannot inject extra commands.
 
+use std::sync::LazyLock;
+
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
@@ -143,6 +145,67 @@ pub fn substitute(template: &str, groups: &[String]) -> String {
     out
 }
 
+/// Compiled detectors for the built-in "magic" actions.
+static URL_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"^https?://\S+$").unwrap());
+static EMAIL_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"^[^@\s]+@[^@\s]+\.[^@\s]+$").unwrap());
+
+/// Built-in "magic" actions inferred from a clipboard value's apparent type
+/// (Klipper's `EnableMagicMimeActions`). Returns only the actions whose
+/// detector matches `text`, so callers can merge them with configured actions.
+/// Each uses the same shell-free [`prepare`] path, so it stays injection-safe.
+pub fn magic_actions(text: &str) -> Vec<Action> {
+    let trimmed = text.trim();
+    let mut out = Vec::new();
+    if URL_RE.is_match(trimmed) {
+        out.push(magic("Abrir link", r"^(https?://\S+)$", "xdg-open %s"));
+    } else if EMAIL_RE.is_match(trimmed) {
+        out.push(magic(
+            "Enviar e-mail",
+            r"^([^@\s]+@[^@\s]+\.[^@\s]+)$",
+            "xdg-open mailto:%s",
+        ));
+    }
+    if is_existing_local_path(trimmed) {
+        out.push(magic("Abrir arquivo", r"^(.+)$", "xdg-open %s"));
+    }
+    out
+}
+
+/// Build a one-command magic action (fire-and-forget, shell-free).
+fn magic(name: &str, regex: &str, command: &str) -> Action {
+    Action {
+        name: name.to_string(),
+        regex: regex.to_string(),
+        strip_whitespace: true,
+        automatic: false,
+        commands: vec![ActionCommand {
+            command: command.to_string(),
+            output: OutputMode::Ignore,
+            shell: false,
+        }],
+    }
+}
+
+/// True when `text` is a single-line absolute (or `~/`) path that exists.
+fn is_existing_local_path(text: &str) -> bool {
+    if text.contains(['\n', '\r']) {
+        return false;
+    }
+    let path = if let Some(rest) = text.strip_prefix("~/") {
+        match std::env::var_os("HOME") {
+            Some(home) => std::path::PathBuf::from(home).join(rest),
+            None => return false,
+        }
+    } else if text.starts_with('/') {
+        std::path::PathBuf::from(text)
+    } else {
+        return false;
+    };
+    path.exists()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,5 +254,28 @@ mod tests {
         // The dangerous value stays a single argv element — not re-tokenized.
         assert_eq!(p.args, vec!["https://x; rm -rf ~".to_string()]);
         assert!(!p.use_shell);
+    }
+
+    #[test]
+    fn magic_actions_detect_url_and_email() {
+        let urls = magic_actions("https://example.com");
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0].name, "Abrir link");
+
+        let mail = magic_actions("  me@example.com  ");
+        assert_eq!(mail.len(), 1);
+        assert_eq!(mail[0].name, "Enviar e-mail");
+
+        assert!(magic_actions("just some text").is_empty());
+        assert!(magic_actions("/nonexistent/path/klippo-xyz").is_empty());
+    }
+
+    #[test]
+    fn magic_email_builds_mailto_argv() {
+        let a = &magic_actions("me@example.com")[0];
+        let m = match_action(a, "me@example.com").unwrap().unwrap();
+        let p = prepare(&a.commands[0], &m).unwrap();
+        assert_eq!(p.program, "xdg-open");
+        assert_eq!(p.args, vec!["mailto:me@example.com".to_string()]);
     }
 }

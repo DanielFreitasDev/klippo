@@ -48,6 +48,8 @@ pub enum UiEvent {
     Toggle,
     /// History changed — rebuild the list if visible.
     Refresh,
+    /// Config changed on disk — reapply theme/font and rebuild.
+    ConfigReloaded,
     /// Copy content to a system clipboard selection (done by the GTK main thread).
     SetClipboard {
         payload: ClipboardPayload,
@@ -67,6 +69,7 @@ pub struct AppState {
     conn: OnceLock<zbus::Connection>,
     to_ui: OnceLock<async_channel::Sender<UiEvent>>,
     last_heartbeat: Mutex<Option<Instant>>,
+    backend: OnceLock<BackendKind>,
 }
 
 impl AppState {
@@ -77,6 +80,7 @@ impl AppState {
             conn: OnceLock::new(),
             to_ui: OnceLock::new(),
             last_heartbeat: Mutex::new(None),
+            backend: OnceLock::new(),
         }
     }
 
@@ -85,9 +89,38 @@ impl AppState {
         let _ = self.to_ui.set(tx);
     }
 
+    /// Record the active capture backend (called once at startup).
+    pub fn set_backend(&self, backend: BackendKind) {
+        let _ = self.backend.set(backend);
+    }
+
+    /// Whether the GNOME capture extension is alive, when it's the active
+    /// backend. `None` for other backends (no extension to watch); otherwise
+    /// `Some(true)` while heartbeats are recent, `Some(false)` when stale.
+    pub(crate) fn extension_status(&self) -> Option<bool> {
+        if self.backend.get().copied() != Some(BackendKind::GnomeBridge) {
+            return None;
+        }
+        let alive = self
+            .last_heartbeat
+            .lock()
+            .unwrap()
+            .map(|t| t.elapsed() < std::time::Duration::from_secs(15))
+            .unwrap_or(false);
+        Some(alive)
+    }
+
     async fn notify_ui(&self, event: UiEvent) {
         if let Some(tx) = self.to_ui.get() {
             let _ = tx.send(event).await;
+        }
+    }
+
+    /// Non-async send for callers off the Tokio runtime (the config watcher
+    /// thread). The channel is unbounded, so this never blocks.
+    fn notify_ui_sync(&self, event: UiEvent) {
+        if let Some(tx) = self.to_ui.get() {
+            let _ = tx.try_send(event);
         }
     }
 
@@ -183,6 +216,27 @@ impl AppState {
         }
     }
 
+    /// Reload config from disk, applying it only if it actually changed. Returns
+    /// `true` when the in-memory config was updated (so the caller can notify
+    /// the UI). A no-op when the file matches memory — which absorbs the echo of
+    /// our own `save()` and prevents a reload loop.
+    pub fn reload_config_from_disk(&self) -> bool {
+        let Ok(fresh) = Config::load() else {
+            return false;
+        };
+        let max_items = {
+            let mut current = self.config.write().unwrap();
+            if *current == fresh {
+                return false;
+            }
+            let max = fresh.general.max_items;
+            *current = fresh;
+            max
+        };
+        self.enforce_history_limit(max_items);
+        true
+    }
+
     /// Apply config and store a text capture. Returns the stored entry, or
     /// `None` if it was filtered out (ignored selection / empty).
     fn ingest_text(&self, text: &str, source: Source) -> klippo_core::Result<Option<Entry>> {
@@ -214,6 +268,32 @@ impl AppState {
         (c.general.actions_enabled, c.actions.clone())
     }
 
+    /// All actions applicable to `text`: the configured ones plus, when
+    /// `enable_magic_mime_actions` is on, the built-in magic detectors (URL,
+    /// e-mail, local file). Magic actions are appended only when their name
+    /// doesn't collide with a configured one — configured actions win.
+    fn applicable_actions(&self, text: &str) -> Vec<klippo_core::actions::Action> {
+        let (enabled, magic, mut actions) = {
+            let c = self.config.read().unwrap();
+            (
+                c.general.actions_enabled,
+                c.general.enable_magic_mime_actions,
+                c.actions.clone(),
+            )
+        };
+        if !enabled {
+            return Vec::new();
+        }
+        if magic {
+            for m in klippo_core::actions::magic_actions(text) {
+                if !actions.iter().any(|a| a.name == m.name) {
+                    actions.push(m);
+                }
+            }
+        }
+        actions
+    }
+
     /// Run a named action against an entry's text (injection-safe execution).
     async fn run_named_action(&self, id: &str, action_name: &str) -> anyhow::Result<()> {
         let text = self
@@ -225,11 +305,29 @@ impl AppState {
             .flatten()
             .and_then(|e| e.text);
         let Some(text) = text else { return Ok(()) };
-        let (_, actions) = self.config_actions();
+        let actions = self.applicable_actions(&text);
         if let Some(action) = actions.iter().find(|a| a.name == action_name) {
             self.execute_action(&text, action).await?;
         }
         Ok(())
+    }
+
+    /// Re-run the first applicable action for an entry when it's re-selected,
+    /// if `replay_action_in_history` is on (Klipper's ReplayActionInHistory).
+    async fn maybe_replay_action(&self, id: &str) {
+        if !self.config.read().unwrap().general.replay_action_in_history {
+            return;
+        }
+        let Some(text) = self.entry_content(id) else {
+            return;
+        };
+        let action = self
+            .applicable_actions(&text)
+            .into_iter()
+            .find(|a| matches!(klippo_core::actions::match_action(a, &text), Ok(Some(_))));
+        if let Some(action) = action {
+            let _ = self.execute_action(&text, &action).await;
+        }
     }
 
     async fn execute_action(
@@ -247,8 +345,12 @@ impl AppState {
             command.args(&prepared.args);
             match prepared.output {
                 OutputMode::Ignore => {
-                    // Fire-and-forget (e.g. xdg-open); the child outlives us.
-                    command.spawn()?;
+                    // Fire-and-forget (e.g. xdg-open); reap the child in the
+                    // background so it doesn't linger as a zombie once it exits.
+                    let mut child = command.spawn()?;
+                    tokio::spawn(async move {
+                        let _ = child.wait().await;
+                    });
                 }
                 OutputMode::ReplaceClipboard => {
                     let out = command.output().await?;
@@ -342,6 +444,10 @@ impl AppState {
         }
     }
 
+    pub(crate) fn ui_set_pinned(&self, id: &str, pinned: bool) {
+        let _ = self.store.lock().unwrap().set_pinned(id, pinned);
+    }
+
     pub(crate) fn popup_width(&self) -> u32 {
         self.config.read().unwrap().ui.popup_width
     }
@@ -352,6 +458,18 @@ impl AppState {
 
     pub(crate) fn color_scheme(&self) -> ColorScheme {
         self.config.read().unwrap().ui.color_scheme
+    }
+
+    pub(crate) fn font_family(&self) -> String {
+        self.config.read().unwrap().ui.font_family.clone()
+    }
+
+    pub(crate) fn action_popup_timeout(&self) -> u32 {
+        self.config
+            .read()
+            .unwrap()
+            .general
+            .timeout_for_action_popups
     }
 
     /// A clone of the current config (for the Settings dialog).
@@ -408,11 +526,7 @@ impl AppState {
         let Some(text) = self.entry_content(id) else {
             return Vec::new();
         };
-        let (enabled, actions) = self.config_actions();
-        if !enabled {
-            return Vec::new();
-        }
-        actions
+        self.applicable_actions(&text)
             .iter()
             .filter(|a| matches!(klippo_core::actions::match_action(a, &text), Ok(Some(_))))
             .map(|a| a.name.clone())
@@ -424,7 +538,7 @@ impl AppState {
     pub(crate) fn run_action_blocking(&self, id: &str, action_name: &str) -> Option<String> {
         use klippo_core::actions::{match_action, prepare, OutputMode};
         let text = self.entry_content(id)?;
-        let (_, actions) = self.config_actions();
+        let actions = self.applicable_actions(&text);
         let action = actions.iter().find(|a| a.name == action_name)?;
         let matched = match match_action(action, &text) {
             Ok(Some(m)) => m,
@@ -461,6 +575,21 @@ impl AppState {
             }
         }
         clipboard_out
+    }
+
+    /// Sync variant of [`Self::maybe_replay_action`] for the GTK main thread:
+    /// re-runs the first applicable action on re-select when enabled. Returns
+    /// any `ReplaceClipboard` output text for the UI to publish.
+    pub(crate) fn maybe_replay_action_blocking(&self, id: &str) -> Option<String> {
+        if !self.config.read().unwrap().general.replay_action_in_history {
+            return None;
+        }
+        let text = self.entry_content(id)?;
+        let action = self
+            .applicable_actions(&text)
+            .into_iter()
+            .find(|a| matches!(klippo_core::actions::match_action(a, &text), Ok(Some(_))))?;
+        self.run_action_blocking(id, &action.name)
     }
 
     /// Store an image capture (PNG bytes) with a thumbnail. `None` if filtered
@@ -522,6 +651,7 @@ impl AppState {
             "sync_clipboards" => c.general.sync_clipboards.to_string(),
             "prevent_empty_clipboard" => c.general.prevent_empty_clipboard.to_string(),
             "actions_enabled" => c.general.actions_enabled.to_string(),
+            "popup_at_cursor" => c.general.popup_at_cursor.to_string(),
             "max_items" => c.general.max_items.to_string(),
             _ => String::new(),
         }
@@ -554,6 +684,9 @@ impl AppState {
                 }
                 "actions_enabled" => {
                     c.general.actions_enabled = value.parse().unwrap_or(c.general.actions_enabled)
+                }
+                "popup_at_cursor" => {
+                    c.general.popup_at_cursor = value.parse().unwrap_or(c.general.popup_at_cursor)
                 }
                 "max_items" => c.general.max_items = value.parse().unwrap_or(c.general.max_items),
                 _ => {}
@@ -626,6 +759,7 @@ impl Daemon1Iface {
         if let Some((payload, target)) = self.state.ui_select(id) {
             self.state.set_clipboard(payload, target).await;
         }
+        self.state.maybe_replay_action(id).await;
         self.state.notify_ui(UiEvent::Hide).await;
         Ok(())
     }
@@ -641,6 +775,12 @@ impl Daemon1Iface {
             .run_named_action(id, action_name)
             .await
             .map_err(to_fdo)
+    }
+
+    async fn set_pinned(&self, id: &str, pinned: bool) -> fdo::Result<()> {
+        self.state.ui_set_pinned(id, pinned);
+        self.state.history_changed().await;
+        Ok(())
     }
 
     async fn list_entries(&self, limit: u32) -> fdo::Result<Vec<DbusEntry>> {
@@ -792,9 +932,45 @@ fn spawn_capture(state: Arc<AppState>) {
                     warn!(error = %e, "Wayland data-control source failed to start");
                 }
             });
+            // KDE/wlroots: bind Super+V through the GlobalShortcuts portal.
+            spawn_global_shortcut(state);
         }
         BackendKind::None => warn!("no usable capture backend detected"),
     }
+}
+
+/// On KDE/wlroots, register a Super+V global shortcut via the XDG portal so the
+/// daemon can be toggled without a desktop-specific keybinding. GNOME binds it
+/// through a gsettings custom keybinding instead (`klippo keybinding`); any
+/// portal error here is non-fatal. Not exercised on GNOME (no such portal).
+fn spawn_global_shortcut(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        if let Err(e) = run_global_shortcut(state).await {
+            warn!(error = %e, "global shortcut portal unavailable (KDE/wlroots only)");
+        }
+    });
+}
+
+async fn run_global_shortcut(state: Arc<AppState>) -> anyhow::Result<()> {
+    use ashpd::desktop::global_shortcuts::{GlobalShortcuts, NewShortcut};
+    use futures_util::StreamExt;
+
+    let shortcuts = GlobalShortcuts::new().await?;
+    let session = shortcuts.create_session(Default::default()).await?;
+    let toggle = NewShortcut::new("toggle", "Abrir/ocultar o histórico do Klippo")
+        .preferred_trigger("LOGO+v");
+    shortcuts
+        .bind_shortcuts(&session, &[toggle], None, Default::default())
+        .await?;
+    info!("global shortcut Super+V registered via the XDG portal");
+
+    let mut activated = shortcuts.receive_activated().await?;
+    while let Some(act) = activated.next().await {
+        if act.shortcut_id() == "toggle" {
+            state.notify_ui(UiEvent::Toggle).await;
+        }
+    }
+    Ok(())
 }
 
 /// Drain `ClipboardEvent`s from a source into the store, emitting changes.
@@ -827,6 +1003,39 @@ async fn consume(
     }
 }
 
+/// Watch the config file and hot-reload it on external edits, asking the UI to
+/// reapply theme/font. Runs on a dedicated OS thread (notify is blocking).
+fn spawn_config_watcher(state: Arc<AppState>) {
+    use notify::{RecursiveMode, Watcher};
+
+    let config_path = paths::config_path();
+    let Some(dir) = config_path.parent().map(|p| p.to_path_buf()) else {
+        return;
+    };
+    std::thread::spawn(move || {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut watcher = match notify::recommended_watcher(tx) {
+            Ok(w) => w,
+            Err(e) => {
+                warn!(error = %e, "config watcher unavailable; hot-reload disabled");
+                return;
+            }
+        };
+        // Watch the directory: editors typically replace the file via rename.
+        if let Err(e) = watcher.watch(&dir, RecursiveMode::NonRecursive) {
+            warn!(error = %e, "could not watch config dir; hot-reload disabled");
+            return;
+        }
+        for res in rx {
+            let Ok(event) = res else { continue };
+            if event.paths.iter().any(|p| p == &config_path) && state.reload_config_from_disk() {
+                info!("config reloaded from disk");
+                state.notify_ui_sync(UiEvent::ConfigReloaded);
+            }
+        }
+    });
+}
+
 /// Entry point for `klippo daemon`: set up state + the background runtime, then
 /// hand the main thread to GTK.
 pub fn run() -> anyhow::Result<()> {
@@ -843,6 +1052,8 @@ pub fn run() -> anyhow::Result<()> {
     let (to_ui_tx, to_ui_rx) = async_channel::unbounded::<UiEvent>();
     let state = Arc::new(AppState::new(store, config));
     state.set_ui_sender(to_ui_tx);
+    state.set_backend(detect_backend());
+    spawn_config_watcher(state.clone());
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

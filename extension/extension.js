@@ -33,6 +33,7 @@ export default class KlippoBridgeExtension extends Extension {
         this._lastText = null;
         this._lastImageSig = null;
         this._ignoreImages = true; // refreshed from the daemon below
+        this._popupAtCursor = false; // refreshed from the daemon below
         this._pendingId = 0;
 
         this._ownerChangedId = this._selection.connect(
@@ -46,6 +47,7 @@ export default class KlippoBridgeExtension extends Extension {
         );
 
         this._refreshConfig();
+        this._call(CAPTURE_IFACE, 'Heartbeat', null);
         this._heartbeatId = GLib.timeout_add_seconds(
             GLib.PRIORITY_DEFAULT,
             HEARTBEAT_S,
@@ -111,6 +113,10 @@ export default class KlippoBridgeExtension extends Extension {
                     return;
                 handled = true;
                 finish();
+                // Honour the daemon's popup_at_cursor setting; otherwise leave
+                // the window where the compositor placed it.
+                if (!this._popupAtCursor)
+                    return;
                 // Defer so the window has its final size before we move it.
                 GLib.timeout_add(GLib.PRIORITY_DEFAULT, 40, () => {
                     this._moveToPointer(win);
@@ -217,21 +223,30 @@ export default class KlippoBridgeExtension extends Extension {
         return `${data.length}:${h >>> 0}`;
     }
 
-    _refreshConfig() {
+    _fetchConfigBool(key, apply) {
         try {
             Gio.DBus.session.call(
                 BUS_NAME, OBJECT_PATH, DAEMON_IFACE, 'GetConfig',
-                new GLib.Variant('(s)', ['ignore_images']),
+                new GLib.Variant('(s)', [key]),
                 new GLib.VariantType('(s)'),
                 Gio.DBusCallFlags.NONE, -1, null,
                 (connection, res) => {
                     try {
                         const [value] = connection.call_finish(res).deepUnpack();
-                        this._ignoreImages = value === 'true';
+                        apply(value === 'true');
                     } catch (_e) {}
                 }
             );
         } catch (_e) {}
+    }
+
+    _refreshConfig() {
+        this._fetchConfigBool('ignore_images', (v) => {
+            this._ignoreImages = v;
+        });
+        this._fetchConfigBool('popup_at_cursor', (v) => {
+            this._popupAtCursor = v;
+        });
     }
 
     _call(iface, method, params) {

@@ -101,9 +101,11 @@ pub fn install_extension() -> Result<()> {
 pub fn keybinding() -> Result<()> {
     if !schema_installed(TRAY_SCHEMA) || !schema_installed(MEDIA_SCHEMA) {
         anyhow::bail!(
-            "esquemas gsettings do GNOME não encontrados — o atalho automático \
-             só é suportado no GNOME. Em outros ambientes, configure o atalho \
-             para 'klippo toggle' manualmente."
+            "esquemas gsettings do GNOME não encontrados — o atalho via gsettings \
+             só é suportado no GNOME. Em KDE/wlroots, o daemon registra o Super+V \
+             automaticamente pelo portal GlobalShortcuts ao iniciar (confirme no \
+             diálogo do sistema). Em outros ambientes, configure 'klippo toggle' \
+             manualmente."
         );
     }
 

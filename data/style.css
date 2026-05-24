@@ -48,3 +48,9 @@
   font-family: "JetBrains Mono", monospace;
   font-size: 9pt;
 }
+
+/* Pinned rows keep their pin button lit and accented, even without hover. */
+.klippo-rowbtn.klippo-pinned {
+  opacity: 1;
+  color: @accent_color;
+}

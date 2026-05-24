@@ -4,5 +4,5 @@
   "description": "Captura mudanças da área de transferência no GNOME Wayland e as envia ao daemon do Klippo via D-Bus. Necessária porque o Mutter não expõe os protocolos data-control. Sem UI própria.",
   "shell-version": ["45", "46", "47", "48", "49", "50"],
   "version": 1,
-  "url": "https://github.com/klippo/klippo"
+  "url": "https://github.com/DanielFreitasDev/klippo"
 }
