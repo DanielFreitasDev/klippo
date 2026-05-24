@@ -1,0 +1,50 @@
+/* Klippo popup styling — compact, Klipper-like, monospace previews. */
+
+.klippo-search {
+  margin: 4px 4px 2px 4px;
+}
+
+.klippo-list {
+  background: transparent;
+}
+
+.klippo-list > row {
+  padding: 3px 4px 3px 8px;
+  min-height: 30px;
+  border-radius: 6px;
+}
+
+.klippo-preview {
+  font-family: "JetBrains Mono", "JetBrainsMono Nerd Font", monospace;
+  font-size: 10pt;
+}
+
+/* Delete button: hidden until the row is hovered or selected (Klipper-like). */
+.klippo-rowbtn {
+  min-width: 24px;
+  min-height: 24px;
+  padding: 0;
+  opacity: 0;
+}
+
+.klippo-list > row:hover .klippo-rowbtn,
+.klippo-list > row:selected .klippo-rowbtn {
+  opacity: 0.65;
+}
+
+.klippo-rowbtn:hover {
+  opacity: 1;
+}
+
+.klippo-empty {
+  color: alpha(currentColor, 0.55);
+  font-style: italic;
+  margin: 18px;
+}
+
+/* Klipper-style item index (1..9). */
+.klippo-index {
+  color: alpha(currentColor, 0.4);
+  font-family: "JetBrains Mono", monospace;
+  font-size: 9pt;
+}

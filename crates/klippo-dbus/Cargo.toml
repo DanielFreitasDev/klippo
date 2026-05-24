@@ -1,0 +1,12 @@
+[package]
+name = "klippo-dbus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Shared zbus D-Bus interface definitions for the Klippo daemon and clients."
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+zbus = "5.15.0"
+zvariant = "5.11.0"

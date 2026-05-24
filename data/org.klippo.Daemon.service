@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=org.klippo.Daemon
+Exec=/usr/bin/klippo daemon
+SystemdService=klippo-daemon.service

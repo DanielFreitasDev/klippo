@@ -1,0 +1,53 @@
+[package]
+name = "klippo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Klippo — a faithful KDE Klipper clone for Linux (Wayland + X11)."
+default-run = "klippo"
+
+[[bin]]
+name = "klippo"
+path = "src/main.rs"
+
+[dependencies]
+klippo-core = { path = "../klippo-core" }
+klippo-capture = { path = "../klippo-capture" }
+klippo-dbus = { path = "../klippo-dbus" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time", "process"] }
+zbus = { version = "5", features = ["tokio"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+gtk4 = "0.11.3"
+libadwaita = { version = "0.9.1", features = ["v1_4"] }
+async-channel = "2.5.0"
+qrcode = "0.14.1"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+
+# Build a .deb with: cargo install cargo-deb && cargo deb -p klippo
+[package.metadata.deb]
+maintainer = "Daniel <testeclaudece@gmail.com>"
+copyright = "2026, Klippo contributors. Licensed GPL-3.0-or-later."
+section = "utils"
+priority = "optional"
+depends = "$auto, libgtk-4-1, libadwaita-1-0"
+extended-description = "Klippo é um gerenciador de histórico da área de transferência para Linux, inspirado no Klipper do KDE, com captura no GNOME Wayland via extensão do Shell, busca em tempo real e atalho Super+V."
+assets = [
+    ["target/release/klippo", "usr/bin/", "755"],
+    ["../../data/klippo-daemon.service", "usr/lib/systemd/user/", "644"],
+    ["../../data/org.klippo.Daemon.service", "usr/share/dbus-1/services/", "644"],
+    ["../../data/klippo.desktop", "etc/xdg/autostart/", "644"],
+    ["../../data/style.css", "usr/share/klippo/", "644"],
+    ["../../data/fonts/JetBrainsMono-Regular.ttf", "usr/share/fonts/truetype/jetbrains-mono/", "644"],
+    ["../../data/fonts/JetBrainsMono-Bold.ttf", "usr/share/fonts/truetype/jetbrains-mono/", "644"],
+    ["../../data/fonts/JetBrainsMono-Italic.ttf", "usr/share/fonts/truetype/jetbrains-mono/", "644"],
+    ["../../data/fonts/JetBrainsMono-BoldItalic.ttf", "usr/share/fonts/truetype/jetbrains-mono/", "644"],
+    ["../../data/fonts/OFL.txt", "usr/share/doc/klippo/OFL.txt", "644"],
+    # The GNOME extension is installed per-user by `klippo install-extension`
+    # (to ~/.local/share/...), so it is not shipped to /usr/share here — that
+    # avoids GNOME's "already installed ... will not be loaded" message.
+    ["../../README.md", "usr/share/doc/klippo/README.md", "644"],
+]

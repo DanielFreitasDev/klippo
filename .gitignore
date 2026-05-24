@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+# Local runtime/data artifacts
+*.db
+*.db-wal
+*.db-shm
+# Source font archive (extracted into data/fonts/)
+/JetBrainsMono-*.zip

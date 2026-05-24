@@ -1,0 +1,24 @@
+[package]
+name = "klippo-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Core model, storage, search, config, and actions for Klippo."
+
+[dependencies]
+blake3 = "1.8.5"
+directories = "6.0.0"
+fancy-regex = { version = "0.18.0", optional = true }
+regex = "1.12.3"
+rusqlite = { version = "0.39.0", features = ["bundled"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+shell-words = "1.1.1"
+thiserror = "2.0.18"
+time = { version = "0.3.47", features = ["formatting"] }
+toml = "1.1.2"
+tracing = "0.1.44"
+
+[features]
+fancy-regex = ["dep:fancy-regex"]

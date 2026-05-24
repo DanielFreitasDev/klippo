@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Klippo
+Comment=Histórico da área de transferência (estilo Klipper)
+Comment[en]=Clipboard history manager (Klipper-style)
+Exec=/usr/bin/klippo daemon
+Icon=edit-paste-symbolic
+Terminal=false
+Categories=Utility;GTK;
+X-GNOME-Autostart-enabled=true
+NoDisplay=true
