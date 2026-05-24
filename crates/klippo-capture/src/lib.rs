@@ -9,6 +9,10 @@
 //! GNOME Shell extension. Writing the clipboard there is done by the focused
 //! GTK popup, so the writer is also a no-op on that path.
 
+use std::borrow::Cow;
+use std::io::Write;
+use std::process::Stdio;
+
 use anyhow::Context;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
@@ -62,6 +66,48 @@ pub enum BackendKind {
     X11,
     /// No usable backend detected.
     None,
+}
+
+/// Clipboard features available for a backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackendCapabilities {
+    pub text: bool,
+    pub image: bool,
+    pub primary: bool,
+    pub sync_clipboards: bool,
+}
+
+/// Capabilities expected from a backend in normal operation.
+pub fn backend_capabilities(kind: BackendKind) -> BackendCapabilities {
+    match kind {
+        BackendKind::GnomeBridge => BackendCapabilities {
+            text: true,
+            image: true,
+            primary: false,
+            sync_clipboards: false,
+        },
+        BackendKind::WaylandDataControl | BackendKind::X11 => BackendCapabilities {
+            text: true,
+            image: true,
+            primary: true,
+            sync_clipboards: true,
+        },
+        BackendKind::None => BackendCapabilities {
+            text: false,
+            image: false,
+            primary: false,
+            sync_clipboards: false,
+        },
+    }
+}
+
+/// Build a writer for environments where the daemon owns clipboard writes.
+pub fn writer_for_backend(kind: BackendKind) -> Box<dyn ClipboardWriter> {
+    match kind {
+        BackendKind::X11 => Box::new(X11Writer),
+        BackendKind::WaylandDataControl => Box::new(WaylandDataControlWriter),
+        BackendKind::GnomeBridge | BackendKind::None => Box::new(NullWriter),
+    }
 }
 
 /// Decide the backend from the environment.
@@ -138,6 +184,85 @@ impl ClipboardWriter for NullWriter {
     }
 }
 
+/// X11 writer backed by arboard. Supports CLIPBOARD and PRIMARY.
+pub struct X11Writer;
+
+impl ClipboardWriter for X11Writer {
+    fn set_text(&self, text: &str, source: Source) -> anyhow::Result<()> {
+        use arboard::SetExtLinux;
+
+        let mut clipboard = arboard::Clipboard::new()?;
+        clipboard
+            .set()
+            .clipboard(linux_selection(source))
+            .text(text.to_string())?;
+        Ok(())
+    }
+
+    fn set_image(&self, _mime: &str, bytes: &[u8], source: Source) -> anyhow::Result<()> {
+        use arboard::{ImageData, SetExtLinux};
+
+        let image = image::load_from_memory(bytes)?.to_rgba8();
+        let (width, height) = image.dimensions();
+        let data = ImageData {
+            width: width as usize,
+            height: height as usize,
+            bytes: Cow::Owned(image.into_raw()),
+        };
+        let mut clipboard = arboard::Clipboard::new()?;
+        clipboard
+            .set()
+            .clipboard(linux_selection(source))
+            .image(data)?;
+        Ok(())
+    }
+}
+
+/// Wayland data-control writer using `wl-copy` from wl-clipboard.
+pub struct WaylandDataControlWriter;
+
+impl ClipboardWriter for WaylandDataControlWriter {
+    fn set_text(&self, text: &str, source: Source) -> anyhow::Result<()> {
+        wl_copy(source, "text/plain;charset=utf-8", text.as_bytes())
+    }
+
+    fn set_image(&self, mime: &str, bytes: &[u8], source: Source) -> anyhow::Result<()> {
+        wl_copy(source, mime, bytes)
+    }
+}
+
+fn linux_selection(source: Source) -> arboard::LinuxClipboardKind {
+    match source {
+        Source::Primary => arboard::LinuxClipboardKind::Primary,
+        Source::Clipboard => arboard::LinuxClipboardKind::Clipboard,
+    }
+}
+
+fn wl_copy(source: Source, mime: &str, bytes: &[u8]) -> anyhow::Result<()> {
+    let mut args = Vec::new();
+    if source == Source::Primary {
+        args.push("--primary".to_string());
+    }
+    args.push("--type".to_string());
+    args.push(mime.to_string());
+
+    let mut child = std::process::Command::new("wl-copy")
+        .args(&args)
+        .stdin(Stdio::piped())
+        .spawn()
+        .context("failed to start `wl-copy` (is wl-clipboard installed?)")?;
+    child
+        .stdin
+        .as_mut()
+        .context("opening wl-copy stdin")?
+        .write_all(bytes)?;
+    let status = child.wait()?;
+    if !status.success() {
+        anyhow::bail!("wl-copy exited with status {status}");
+    }
+    Ok(())
+}
+
 /// X11 clipboard monitor. Polls the CLIPBOARD selection via `arboard` on a
 /// dedicated thread (real X11 sessions; under Xwayland `arboard` may pick the
 /// Wayland backend, which GNOME doesn't allow — there the GNOME bridge is used).
@@ -162,19 +287,15 @@ impl ClipboardSource for X11Source {
                     return;
                 }
             };
-            let mut last = String::new();
+            let mut clipboard_state = SelectionState::default();
+            let mut primary_state = SelectionState::default();
             loop {
-                if let Ok(text) = clipboard.get_text() {
-                    if !text.is_empty() && text != last {
-                        last = text.clone();
-                        let event = ClipboardEvent::Text {
-                            text,
-                            source: Source::Clipboard,
-                        };
-                        if tx.blocking_send(event).is_err() {
-                            break; // consumer dropped → daemon shutting down
-                        }
-                    }
+                if !poll_x11_selection(&mut clipboard, &tx, Source::Clipboard, &mut clipboard_state)
+                {
+                    break;
+                }
+                if !poll_x11_selection(&mut clipboard, &tx, Source::Primary, &mut primary_state) {
+                    break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(500));
             }
@@ -185,6 +306,82 @@ impl ClipboardSource for X11Source {
     fn name(&self) -> &'static str {
         "x11-poll"
     }
+}
+
+#[derive(Default)]
+struct SelectionState {
+    last_text: String,
+    last_image: String,
+    was_empty: bool,
+}
+
+fn poll_x11_selection(
+    clipboard: &mut arboard::Clipboard,
+    tx: &mpsc::Sender<ClipboardEvent>,
+    source: Source,
+    state: &mut SelectionState,
+) -> bool {
+    use arboard::GetExtLinux;
+
+    let selection = linux_selection(source);
+    if let Ok(text) = clipboard.get().clipboard(selection).text() {
+        if !text.is_empty() && text != state.last_text {
+            state.last_text = text.clone();
+            state.last_image.clear();
+            state.was_empty = false;
+            return tx
+                .blocking_send(ClipboardEvent::Text { text, source })
+                .is_ok();
+        }
+        return true;
+    }
+
+    if let Ok(image) = clipboard.get().clipboard(selection).image() {
+        let bytes = match image_data_to_png(image) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::warn!(error = %e, "X11: could not encode clipboard image");
+                return true;
+            }
+        };
+        let hash = klippo_core::model::hash_bytes(&bytes);
+        if hash != state.last_image {
+            state.last_text.clear();
+            state.last_image = hash;
+            state.was_empty = false;
+            return tx
+                .blocking_send(ClipboardEvent::Image {
+                    mime: "image/png".to_string(),
+                    bytes,
+                    source,
+                })
+                .is_ok();
+        }
+        return true;
+    }
+
+    if !state.was_empty {
+        state.last_text.clear();
+        state.last_image.clear();
+        state.was_empty = true;
+        return tx.blocking_send(ClipboardEvent::Cleared { source }).is_ok();
+    }
+    true
+}
+
+fn image_data_to_png(image: arboard::ImageData<'static>) -> anyhow::Result<Vec<u8>> {
+    let rgba = image::RgbaImage::from_raw(
+        image.width as u32,
+        image.height as u32,
+        image.bytes.into_owned(),
+    )
+    .context("invalid RGBA clipboard image")?;
+    let mut bytes = Vec::new();
+    image::DynamicImage::ImageRgba8(rgba).write_to(
+        &mut std::io::Cursor::new(&mut bytes),
+        image::ImageFormat::Png,
+    )?;
+    Ok(bytes)
 }
 
 /// Wayland data-control monitor for KDE 6.4+/wlroots/Sway. Delegates to
@@ -203,12 +400,18 @@ impl WaylandDataControlSource {
 impl ClipboardSource for WaylandDataControlSource {
     async fn run(self: Box<Self>, _tx: mpsc::Sender<ClipboardEvent>) -> anyhow::Result<()> {
         let exe = std::env::current_exe().context("locating the klippo executable")?;
-        std::process::Command::new("wl-paste")
-            .arg("--watch")
-            .arg(&exe)
-            .arg("__feed")
-            .spawn()
-            .context("failed to start `wl-paste --watch` (is wl-clipboard installed?)")?;
+        for (mime, subcommand) in [("text/plain", "__feed"), ("image/png", "__feed-image")] {
+            std::process::Command::new("wl-paste")
+                .arg("--watch")
+                .arg("--type")
+                .arg(mime)
+                .arg(&exe)
+                .arg(subcommand)
+                .spawn()
+                .with_context(|| {
+                    "failed to start `wl-paste --watch` (is wl-clipboard installed?)"
+                })?;
+        }
         Ok(())
     }
 
@@ -229,5 +432,13 @@ mod tests {
             Source::Clipboard
         );
         assert_eq!(parse_source("anything-else"), Source::Clipboard);
+    }
+
+    #[test]
+    fn capabilities_match_backend_scope() {
+        assert!(backend_capabilities(BackendKind::X11).primary);
+        assert!(backend_capabilities(BackendKind::WaylandDataControl).sync_clipboards);
+        assert!(!backend_capabilities(BackendKind::GnomeBridge).primary);
+        assert!(!backend_capabilities(BackendKind::None).text);
     }
 }

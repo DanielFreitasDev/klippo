@@ -93,6 +93,11 @@ impl Store {
         self.prune(max_items)
     }
 
+    /// Prune the store to `max_items`, returning removed entries for image GC.
+    pub fn enforce_limit(&self, max_items: u32) -> Result<Vec<Entry>> {
+        self.prune(max_items)
+    }
+
     /// Promote an existing entry to the top of the MRU order.
     pub fn touch(&self, id: &str, now_ms: i64) -> Result<()> {
         self.conn.execute(
@@ -257,5 +262,21 @@ mod tests {
         let cleared = s.clear().unwrap();
         assert_eq!(cleared.len(), 1);
         assert_eq!(s.count().unwrap(), 0);
+    }
+
+    #[test]
+    fn enforce_limit_returns_pruned_entries() {
+        let s = Store::open_in_memory().unwrap();
+        for i in 0..5 {
+            s.upsert(&text(&format!("item{i}"), i), 5).unwrap();
+        }
+
+        let pruned = s.enforce_limit(2).unwrap();
+
+        assert_eq!(pruned.len(), 3);
+        assert_eq!(s.count().unwrap(), 2);
+        let list = s.list(10).unwrap();
+        assert_eq!(list[0].text.as_deref(), Some("item4"));
+        assert_eq!(list[1].text.as_deref(), Some("item3"));
     }
 }

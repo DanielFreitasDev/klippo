@@ -51,3 +51,23 @@ pub fn feed() -> Result<()> {
         Ok::<(), anyhow::Error>(())
     })
 }
+
+/// Read stdin and push it to the daemon as a PNG image capture. Invoked by
+/// `wl-paste --watch --type image/png klippo __feed-image`.
+pub fn feed_image() -> Result<()> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::io::stdin().read_to_end(&mut bytes)?;
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async move {
+        let conn = zbus::Connection::session().await?;
+        let proxy = Capture1Proxy::new(&conn).await?;
+        proxy.add_image("image/png", &bytes, "clipboard").await?;
+        Ok::<(), anyhow::Error>(())
+    })
+}

@@ -25,6 +25,21 @@ use klippo_core::store::Store;
 use klippo_core::{paths, Source};
 use klippo_dbus::{DbusEntry, BUS_NAME, OBJECT_PATH};
 
+/// Concrete clipboard content the UI can publish through GDK.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClipboardPayload {
+    Text(String),
+    Image { mime: String, bytes: Vec<u8> },
+}
+
+/// Which Linux selection should receive clipboard content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardTarget {
+    Clipboard,
+    Primary,
+    Both,
+}
+
 /// An event pushed from the daemon to the GTK UI.
 #[derive(Debug, Clone)]
 pub enum UiEvent {
@@ -33,8 +48,11 @@ pub enum UiEvent {
     Toggle,
     /// History changed — rebuild the list if visible.
     Refresh,
-    /// Copy this text to the system clipboard (done by the focused popup).
-    SetClipboard(String),
+    /// Copy content to a system clipboard selection (done by the GTK main thread).
+    SetClipboard {
+        payload: ClipboardPayload,
+        target: ClipboardTarget,
+    },
     /// Offer an action menu for an entry (entry id + matching action names).
     ActionMenu {
         id: String,
@@ -83,6 +101,88 @@ impl AppState {
         self.notify_ui(UiEvent::Refresh).await;
     }
 
+    async fn set_clipboard(&self, payload: ClipboardPayload, target: ClipboardTarget) {
+        self.notify_ui(UiEvent::SetClipboard { payload, target })
+            .await;
+    }
+
+    fn payload_from_entry(entry: &Entry) -> Option<ClipboardPayload> {
+        match entry.kind {
+            EntryKind::Text => entry.text.clone().map(ClipboardPayload::Text),
+            EntryKind::Image => {
+                let path = entry.image_path.as_ref()?;
+                let bytes = std::fs::read(path).ok()?;
+                Some(ClipboardPayload::Image {
+                    mime: "image/png".to_string(),
+                    bytes,
+                })
+            }
+        }
+    }
+
+    fn payload_for_entry(&self, id: &str, touch: bool) -> Option<ClipboardPayload> {
+        let entry = {
+            let store = self.store.lock().ok()?;
+            if touch {
+                let _ = store.touch(id, now_ms());
+            }
+            store.get(id).ok().flatten()
+        }?;
+        Self::payload_from_entry(&entry)
+    }
+
+    fn latest_payload(&self) -> Option<ClipboardPayload> {
+        let entry = self.store.lock().ok()?.list(1).ok()?.into_iter().next()?;
+        Self::payload_from_entry(&entry)
+    }
+
+    fn selection_target_for_select(&self) -> ClipboardTarget {
+        if self.config.read().unwrap().general.sync_clipboards {
+            ClipboardTarget::Both
+        } else {
+            ClipboardTarget::Clipboard
+        }
+    }
+
+    async fn maybe_sync_clipboards(&self, entry: &Entry, source: Source) {
+        if !self.config.read().unwrap().general.sync_clipboards {
+            return;
+        }
+        let Some(payload) = Self::payload_from_entry(entry) else {
+            return;
+        };
+        let target = match source {
+            Source::Clipboard => ClipboardTarget::Primary,
+            Source::Primary => ClipboardTarget::Clipboard,
+        };
+        self.set_clipboard(payload, target).await;
+    }
+
+    async fn restore_clipboard_if_needed(&self, source: Source) {
+        if source != Source::Clipboard {
+            return;
+        }
+        if !self.config.read().unwrap().general.prevent_empty_clipboard {
+            return;
+        }
+        if let Some(payload) = self.latest_payload() {
+            self.set_clipboard(payload, ClipboardTarget::Clipboard)
+                .await;
+        }
+    }
+
+    fn enforce_history_limit(&self, max_items: u32) {
+        let removed = self
+            .store
+            .lock()
+            .ok()
+            .and_then(|store| store.enforce_limit(max_items).ok())
+            .unwrap_or_default();
+        for e in &removed {
+            gc_entry(e);
+        }
+    }
+
     /// Apply config and store a text capture. Returns the stored entry, or
     /// `None` if it was filtered out (ignored selection / empty).
     fn ingest_text(&self, text: &str, source: Source) -> klippo_core::Result<Option<Entry>> {
@@ -102,7 +202,10 @@ impl AppState {
             return Ok(None);
         }
         let entry = Entry::new_text(processed, now_ms());
-        self.store.lock().unwrap().upsert(&entry, max_items)?;
+        let pruned = self.store.lock().unwrap().upsert(&entry, max_items)?;
+        for e in &pruned {
+            gc_entry(e);
+        }
         Ok(Some(entry))
     }
 
@@ -151,7 +254,11 @@ impl AppState {
                     let out = command.output().await?;
                     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
                     if !s.is_empty() {
-                        self.notify_ui(UiEvent::SetClipboard(s.clone())).await;
+                        self.set_clipboard(
+                            ClipboardPayload::Text(s.clone()),
+                            ClipboardTarget::Clipboard,
+                        )
+                        .await;
                         let _ = self.ingest_text(&s, Source::Clipboard);
                         self.history_changed().await;
                     }
@@ -215,11 +322,10 @@ impl AppState {
         self.store.lock().unwrap().list(max).unwrap_or_default()
     }
 
-    /// Promote an entry to the top and return its text (to copy to clipboard).
-    pub(crate) fn ui_select(&self, id: &str) -> Option<String> {
-        let store = self.store.lock().unwrap();
-        let _ = store.touch(id, now_ms());
-        store.get(id).ok().flatten().and_then(|e| e.text)
+    /// Promote an entry to the top and return its content (to copy to clipboard).
+    pub(crate) fn ui_select(&self, id: &str) -> Option<(ClipboardPayload, ClipboardTarget)> {
+        let payload = self.payload_for_entry(id, true)?;
+        Some((payload, self.selection_target_for_select()))
     }
 
     pub(crate) fn ui_remove(&self, id: &str) {
@@ -255,9 +361,13 @@ impl AppState {
 
     /// Mutate + persist the config (used by the Settings dialog).
     pub(crate) fn update_config(&self, edit: impl FnOnce(&mut Config)) {
-        let mut c = self.config.write().unwrap();
-        edit(&mut c);
-        let _ = c.save();
+        let max_items = {
+            let mut c = self.config.write().unwrap();
+            edit(&mut c);
+            let _ = c.save();
+            c.general.max_items
+        };
+        self.enforce_history_limit(max_items);
     }
 
     /// Full text of an entry (for the Edit and QR dialogs).
@@ -280,7 +390,11 @@ impl AppState {
         let max = self.config.read().unwrap().general.max_items;
         let entry = Entry::new_text(new_text, now_ms());
         let store = self.store.lock().unwrap();
-        let _ = store.upsert(&entry, max);
+        if let Ok(pruned) = store.upsert(&entry, max) {
+            for e in &pruned {
+                gc_entry(e);
+            }
+        }
         if old_id != entry.id {
             if let Ok(Some(old)) = store.remove(old_id) {
                 gc_entry(&old);
@@ -389,7 +503,10 @@ impl AppState {
         std::fs::write(&img_path, bytes)?;
         img.thumbnail(96, 64).save(&thumb_path)?;
         let entry = Entry::new_image(id, img_path, thumb_path, w, h, now_ms());
-        self.store.lock().unwrap().upsert(&entry, max_items)?;
+        let pruned = self.store.lock().unwrap().upsert(&entry, max_items)?;
+        for e in &pruned {
+            gc_entry(e);
+        }
         Ok(Some(entry))
     }
 
@@ -400,6 +517,8 @@ impl AppState {
         match key {
             "ignore_images" => c.general.ignore_images.to_string(),
             "ignore_selection" => c.general.ignore_selection.to_string(),
+            "keep_clipboard_contents" => c.general.keep_clipboard_contents.to_string(),
+            "selection_text_only" => c.general.selection_text_only.to_string(),
             "sync_clipboards" => c.general.sync_clipboards.to_string(),
             "prevent_empty_clipboard" => c.general.prevent_empty_clipboard.to_string(),
             "actions_enabled" => c.general.actions_enabled.to_string(),
@@ -409,28 +528,41 @@ impl AppState {
     }
 
     fn set_config_str(&self, key: &str, value: &str) -> klippo_core::Result<()> {
-        let mut c = self.config.write().unwrap();
-        match key {
-            "ignore_images" => {
-                c.general.ignore_images = value.parse().unwrap_or(c.general.ignore_images)
+        let max_items = {
+            let mut c = self.config.write().unwrap();
+            match key {
+                "ignore_images" => {
+                    c.general.ignore_images = value.parse().unwrap_or(c.general.ignore_images)
+                }
+                "ignore_selection" => {
+                    c.general.ignore_selection = value.parse().unwrap_or(c.general.ignore_selection)
+                }
+                "keep_clipboard_contents" => {
+                    c.general.keep_clipboard_contents =
+                        value.parse().unwrap_or(c.general.keep_clipboard_contents)
+                }
+                "selection_text_only" => {
+                    c.general.selection_text_only =
+                        value.parse().unwrap_or(c.general.selection_text_only)
+                }
+                "sync_clipboards" => {
+                    c.general.sync_clipboards = value.parse().unwrap_or(c.general.sync_clipboards)
+                }
+                "prevent_empty_clipboard" => {
+                    c.general.prevent_empty_clipboard =
+                        value.parse().unwrap_or(c.general.prevent_empty_clipboard)
+                }
+                "actions_enabled" => {
+                    c.general.actions_enabled = value.parse().unwrap_or(c.general.actions_enabled)
+                }
+                "max_items" => c.general.max_items = value.parse().unwrap_or(c.general.max_items),
+                _ => {}
             }
-            "ignore_selection" => {
-                c.general.ignore_selection = value.parse().unwrap_or(c.general.ignore_selection)
-            }
-            "sync_clipboards" => {
-                c.general.sync_clipboards = value.parse().unwrap_or(c.general.sync_clipboards)
-            }
-            "prevent_empty_clipboard" => {
-                c.general.prevent_empty_clipboard =
-                    value.parse().unwrap_or(c.general.prevent_empty_clipboard)
-            }
-            "actions_enabled" => {
-                c.general.actions_enabled = value.parse().unwrap_or(c.general.actions_enabled)
-            }
-            "max_items" => c.general.max_items = value.parse().unwrap_or(c.general.max_items),
-            _ => {}
-        }
-        c.save()
+            c.save()?;
+            c.general.max_items
+        };
+        self.enforce_history_limit(max_items);
+        Ok(())
     }
 }
 
@@ -491,8 +623,8 @@ impl Daemon1Iface {
     }
 
     async fn select(&self, id: &str) -> fdo::Result<()> {
-        if let Some(text) = self.state.ui_select(id) {
-            self.state.notify_ui(UiEvent::SetClipboard(text)).await;
+        if let Some((payload, target)) = self.state.ui_select(id) {
+            self.state.set_clipboard(payload, target).await;
         }
         self.state.notify_ui(UiEvent::Hide).await;
         Ok(())
@@ -520,22 +652,11 @@ impl Daemon1Iface {
     }
 
     async fn get_entry_content(&self, id: &str) -> fdo::Result<(String, Vec<u8>)> {
-        let entry = {
-            let store = self.state.store.lock().unwrap();
-            store.get(id).map_err(to_fdo)?
-        };
-        match entry {
-            Some(e) if e.kind == EntryKind::Text => Ok((
-                "text/plain;charset=utf-8".to_string(),
-                e.text.unwrap_or_default().into_bytes(),
-            )),
-            Some(e) => {
-                let bytes = e
-                    .image_path
-                    .and_then(|p| std::fs::read(p).ok())
-                    .unwrap_or_default();
-                Ok(("image/png".to_string(), bytes))
+        match self.state.payload_for_entry(id, false) {
+            Some(ClipboardPayload::Text(text)) => {
+                Ok(("text/plain;charset=utf-8".to_string(), text.into_bytes()))
             }
+            Some(ClipboardPayload::Image { mime, bytes }) => Ok((mime, bytes)),
             None => Err(fdo::Error::Failed(format!("no entry with id {id}"))),
         }
     }
@@ -580,31 +701,32 @@ pub struct Capture1Iface {
 #[interface(name = "org.klippo.Capture1")]
 impl Capture1Iface {
     async fn add_text(&self, text: &str, source: &str) -> fdo::Result<()> {
-        if let Some(entry) = self
-            .state
-            .ingest_text(text, parse_source(source))
-            .map_err(to_fdo)?
-        {
+        let source = parse_source(source);
+        if let Some(entry) = self.state.ingest_text(text, source).map_err(to_fdo)? {
             self.state.history_changed().await;
+            self.state.maybe_sync_clipboards(&entry, source).await;
             self.state.maybe_emit_action_popup(&entry).await;
         }
         Ok(())
     }
 
     async fn add_image(&self, mime: &str, bytes: Vec<u8>, source: &str) -> fdo::Result<()> {
-        if self
+        let source = parse_source(source);
+        if let Some(entry) = self
             .state
-            .ingest_image(mime, &bytes, parse_source(source))
+            .ingest_image(mime, &bytes, source)
             .map_err(to_fdo)?
-            .is_some()
         {
             self.state.history_changed().await;
+            self.state.maybe_sync_clipboards(&entry, source).await;
         }
         Ok(())
     }
 
-    async fn clipboard_cleared(&self, _source: &str) {
-        // PreventEmptyClipboard handling lands in P2.
+    async fn clipboard_cleared(&self, source: &str) {
+        self.state
+            .restore_clipboard_if_needed(parse_source(source))
+            .await;
     }
 
     async fn heartbeat(&self) {
@@ -686,6 +808,7 @@ async fn consume(
             ClipboardEvent::Text { text, source } => {
                 if let Ok(Some(entry)) = state.ingest_text(&text, source) {
                     state.history_changed().await;
+                    state.maybe_sync_clipboards(&entry, source).await;
                     state.maybe_emit_action_popup(&entry).await;
                 }
             }
@@ -694,16 +817,12 @@ async fn consume(
                 bytes,
                 source,
             } => {
-                if state
-                    .ingest_image(&mime, &bytes, source)
-                    .ok()
-                    .flatten()
-                    .is_some()
-                {
+                if let Some(entry) = state.ingest_image(&mime, &bytes, source).ok().flatten() {
                     state.history_changed().await;
+                    state.maybe_sync_clipboards(&entry, source).await;
                 }
             }
-            ClipboardEvent::Cleared { .. } => {}
+            ClipboardEvent::Cleared { source } => state.restore_clipboard_if_needed(source).await,
         }
     }
 }
@@ -713,6 +832,12 @@ async fn consume(
 pub fn run() -> anyhow::Result<()> {
     let config = Config::load()?;
     let store = Store::open(&paths::db_path())?;
+    if !config.general.keep_clipboard_contents {
+        let removed = store.clear()?;
+        for e in &removed {
+            gc_entry(e);
+        }
+    }
     info!(db = %paths::db_path().display(), "history store opened");
 
     let (to_ui_tx, to_ui_rx) = async_channel::unbounded::<UiEvent>();
@@ -732,4 +857,76 @@ pub fn run() -> anyhow::Result<()> {
     // Runs the GTK main loop; keeps `rt` alive for its duration.
     crate::ui::run(state, to_ui_rx, rt);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use klippo_core::model::hash_bytes;
+
+    fn state() -> AppState {
+        AppState::new(Store::open_in_memory().unwrap(), Config::default())
+    }
+
+    #[test]
+    fn ui_select_returns_text_payload_and_promotes() {
+        let state = state();
+        let a = Entry::new_text("old", 1);
+        let b = Entry::new_text("new", 2);
+        state.store.lock().unwrap().upsert(&a, 25).unwrap();
+        state.store.lock().unwrap().upsert(&b, 25).unwrap();
+
+        let selected = state.ui_select(&a.id).unwrap();
+
+        assert_eq!(
+            selected,
+            (
+                ClipboardPayload::Text("old".to_string()),
+                ClipboardTarget::Clipboard
+            )
+        );
+        let list = state.entries();
+        assert_eq!(list[0].text.as_deref(), Some("old"));
+    }
+
+    #[test]
+    fn ui_select_returns_image_payload() {
+        let state = state();
+        let path = std::env::temp_dir().join(format!(
+            "klippo-test-image-{}-{}.png",
+            std::process::id(),
+            now_ms()
+        ));
+        let bytes = tiny_png();
+        std::fs::write(&path, &bytes).unwrap();
+        let entry = Entry::new_image(hash_bytes(&bytes), path.clone(), path.clone(), 1, 1, 1);
+        state.store.lock().unwrap().upsert(&entry, 25).unwrap();
+
+        let selected = state.ui_select(&entry.id).unwrap();
+
+        assert_eq!(
+            selected,
+            (
+                ClipboardPayload::Image {
+                    mime: "image/png".to_string(),
+                    bytes: bytes.clone()
+                },
+                ClipboardTarget::Clipboard
+            )
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn tiny_png() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let img = image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]));
+        let dyn_img = image::DynamicImage::ImageRgba8(img);
+        dyn_img
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        bytes
+    }
 }

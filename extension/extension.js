@@ -31,7 +31,7 @@ export default class KlippoBridgeExtension extends Extension {
         this._selection = global.display.get_selection();
         this._clipboard = St.Clipboard.get_default();
         this._lastText = null;
-        this._lastImageLen = 0;
+        this._lastImageSig = null;
         this._ignoreImages = true; // refreshed from the daemon below
         this._pendingId = 0;
 
@@ -172,20 +172,33 @@ export default class KlippoBridgeExtension extends Extension {
                 if (text === this._lastText)
                     return;
                 this._lastText = text;
+                this._lastImageSig = null;
                 this._call(CAPTURE_IFACE, 'AddText', new GLib.Variant('(ss)', [text, 'clipboard']));
                 return;
             }
-            // No text → it may be an image. Skip entirely when images are off
-            // (avoids shipping large payloads over D-Bus for nothing).
-            if (this._ignoreImages)
-                return;
+            // No text → it may be an image or an actual clear. We still inspect
+            // image/png when images are ignored so clears can be reported.
             this._clipboard.get_content(St.ClipboardType.CLIPBOARD, 'image/png', (_c, bytes) => {
-                if (!bytes)
+                if (!bytes) {
+                    this._lastText = null;
+                    this._lastImageSig = null;
+                    this._call(CAPTURE_IFACE, 'ClipboardCleared', new GLib.Variant('(s)', ['clipboard']));
                     return;
+                }
                 const data = bytes.get_data();
-                if (!data || data.length === 0 || data.length === this._lastImageLen)
+                if (!data || data.length === 0) {
+                    this._lastText = null;
+                    this._lastImageSig = null;
+                    this._call(CAPTURE_IFACE, 'ClipboardCleared', new GLib.Variant('(s)', ['clipboard']));
                     return;
-                this._lastImageLen = data.length;
+                }
+                this._lastText = null;
+                if (this._ignoreImages)
+                    return;
+                const sig = this._hashBytes(data);
+                if (sig === this._lastImageSig)
+                    return;
+                this._lastImageSig = sig;
                 const ay = GLib.Variant.new_from_bytes(new GLib.VariantType('ay'), bytes, true);
                 const params = GLib.Variant.new_tuple([
                     GLib.Variant.new_string('image/png'),
@@ -195,6 +208,13 @@ export default class KlippoBridgeExtension extends Extension {
                 this._call(CAPTURE_IFACE, 'AddImage', params);
             });
         });
+    }
+
+    _hashBytes(data) {
+        let h = 2166136261;
+        for (let i = 0; i < data.length; i++)
+            h = Math.imul(h ^ data[i], 16777619);
+        return `${data.length}:${h >>> 0}`;
     }
 
     _refreshConfig() {

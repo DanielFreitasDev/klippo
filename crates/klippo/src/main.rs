@@ -43,6 +43,9 @@ enum Command {
     /// (interno) Lê stdin e o envia como captura de texto — usado por `wl-paste --watch`.
     #[command(name = "__feed", hide = true)]
     Feed,
+    /// (interno) Lê stdin e o envia como captura de imagem — usado por `wl-paste --watch`.
+    #[command(name = "__feed-image", hide = true)]
+    FeedImage,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -63,5 +66,6 @@ fn main() -> anyhow::Result<()> {
         Command::InstallExtension => setup::install_extension(),
         Command::Keybinding => setup::keybinding(),
         Command::Feed => client::feed(),
+        Command::FeedImage => client::feed_image(),
     }
 }

@@ -22,7 +22,8 @@ para se integrar bem ao GNOME e a outros desktops Linux.
 ## Funcionalidades
 
 - 📋 **Histórico de texto e imagens** — mais recente no topo, deduplicação
-  automática, tamanho configurável (padrão **25**), persiste entre reinícios.
+  automática, tamanho configurável (padrão **25**), copia textos ou imagens de
+  volta para a área de transferência e persiste entre reinícios.
 - 🔍 **Busca em tempo real** — digite para filtrar; apague para voltar à lista
   completa.
 - ⌨️ **Itens numerados** (1–9) com seleção rápida por **Alt+1…Alt+9**; setas e
@@ -44,9 +45,9 @@ para se integrar bem ao GNOME e a outros desktops Linux.
 
 | Desktop / sessão | Captura | Super+V | Abrir no cursor |
 |---|---|---|---|
-| **GNOME (Wayland)** — Ubuntu, Fedora, … | ✅ extensão do GNOME Shell | ✅ configurado automaticamente | ✅ |
-| **X11** (qualquer desktop) | ✅ polling | ⚙️ vincule `klippo toggle` | ➖ posicionado pelo WM |
-| **KDE Plasma 6 / wlroots** (Sway, Hyprland) | ✅ `wl-paste --watch` (requer `wl-clipboard`) | ⚙️ vincule `klippo toggle` | ➖ posicionado pelo compositor |
+| **GNOME (Wayland)** — Ubuntu, Fedora, … | ✅ extensão do GNOME Shell (texto + imagens PNG) | ✅ configurado automaticamente | ✅ |
+| **X11** (qualquer desktop) | ✅ polling de CLIPBOARD + PRIMARY (texto + imagens) | ⚙️ vincule `klippo toggle` | ➖ posicionado pelo WM |
+| **KDE Plasma 6 / wlroots** (Sway, Hyprland) | ✅ `wl-paste --watch` para texto + imagens PNG (requer `wl-clipboard`) | ⚙️ vincule `klippo toggle` | ➖ posicionado pelo compositor |
 
 > O alvo principal de desenvolvimento e testes é o **GNOME no Wayland (Ubuntu)**.
 > Os backends de X11 e de Wayland data-control estão implementados; testes nessas
@@ -100,8 +101,9 @@ atalho a `klippo toggle` nas configurações do desktop/WM e garantir que o
 | Limpar tudo · Configurações | botões no rodapé |
 | Dispensar | **Esc** ou clicar fora |
 
-Selecionar um item copia-o para a área de transferência (**não** cola
-automaticamente) e o move para o topo — igual ao Klipper.
+Selecionar um item copia seu conteúdo (texto ou imagem) para a área de
+transferência (**não** cola automaticamente) e o move para o topo — igual ao
+Klipper.
 
 ## Configuração
 
@@ -112,8 +114,10 @@ Klipper na primeira execução); o histórico fica em
 ```toml
 [general]
 max_items = 25
+keep_clipboard_contents = true
 ignore_images = true
 ignore_selection = true          # não captura seleções do mouse (PRIMARY)
+selection_text_only = true       # seleções PRIMARY só armazenam texto
 sync_clipboards = false
 prevent_empty_clipboard = true
 actions_enabled = true

@@ -21,7 +21,8 @@ to feel at home on GNOME and other Linux desktops.
 ## Features
 
 - 📋 **Text & image history** — most-recent-first, automatic de-duplication,
-  configurable size (default **25**), persists across reboots.
+  configurable size (default **25**), copies text or images back to the
+  clipboard, and persists across reboots.
 - 🔍 **Real-time search** — start typing to filter; clear the box to restore the
   full list.
 - ⌨️ **Numbered items** (1–9) with **Alt+1…Alt+9** quick-select; arrow keys and
@@ -42,9 +43,9 @@ to feel at home on GNOME and other Linux desktops.
 
 | Desktop / session | Clipboard capture | Super+V | Open at cursor |
 |---|---|---|---|
-| **GNOME (Wayland)** — Ubuntu, Fedora, … | ✅ GNOME Shell extension | ✅ set up automatically | ✅ |
-| **X11** (any desktop) | ✅ polling | ⚙️ bind `klippo toggle` | ➖ placed by the WM |
-| **KDE Plasma 6 / wlroots** (Sway, Hyprland) | ✅ `wl-paste --watch` (needs `wl-clipboard`) | ⚙️ bind `klippo toggle` | ➖ placed by the compositor |
+| **GNOME (Wayland)** — Ubuntu, Fedora, … | ✅ GNOME Shell extension (text + PNG images) | ✅ set up automatically | ✅ |
+| **X11** (any desktop) | ✅ polling CLIPBOARD + PRIMARY (text + images) | ⚙️ bind `klippo toggle` | ➖ placed by the WM |
+| **KDE Plasma 6 / wlroots** (Sway, Hyprland) | ✅ `wl-paste --watch` for text + PNG images (needs `wl-clipboard`) | ⚙️ bind `klippo toggle` | ➖ placed by the compositor |
 
 > The primary development and testing target is **GNOME on Wayland (Ubuntu)**.
 > The X11 and Wayland data-control backends are implemented; testing on those
@@ -98,8 +99,8 @@ at login (the `.deb` autostarts it).
 | Clear all · Settings | footer buttons |
 | Dismiss | **Esc** or click outside |
 
-Selecting an item copies it to the clipboard (it does **not** auto-paste) and
-moves it to the top — same as Klipper.
+Selecting an item copies its content (text or image) to the clipboard (it does
+**not** auto-paste) and moves it to the top — same as Klipper.
 
 ## Configuration
 
@@ -109,8 +110,10 @@ defaults on first run); history is stored at `~/.local/share/klippo/history.db`.
 ```toml
 [general]
 max_items = 25
+keep_clipboard_contents = true
 ignore_images = true
 ignore_selection = true          # don't capture mouse (PRIMARY) selections
+selection_text_only = true       # PRIMARY selections only store text
 sync_clipboards = false
 prevent_empty_clipboard = true
 actions_enabled = true

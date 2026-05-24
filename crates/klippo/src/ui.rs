@@ -13,6 +13,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gtk4 as gtk;
+use gtk4::gdk_pixbuf;
+use gtk4::gdk_pixbuf::prelude::*;
 use gtk4::prelude::*;
 use gtk4::{gdk, glib, pango};
 use libadwaita as adw;
@@ -22,7 +24,7 @@ use klippo_core::config::ColorScheme;
 use klippo_core::model::EntryKind;
 use klippo_core::search;
 
-use crate::daemon::{AppState, UiEvent};
+use crate::daemon::{AppState, ClipboardPayload, ClipboardTarget, UiEvent};
 
 const STYLE: &str = include_str!("../../../data/style.css");
 
@@ -280,7 +282,7 @@ fn build_window(
                             ui.rebuild(ui.search.text().as_str());
                         }
                     }
-                    UiEvent::SetClipboard(text) => ui.window.clipboard().set_text(&text),
+                    UiEvent::SetClipboard { payload, target } => ui.set_clipboard(&payload, target),
                     UiEvent::ActionMenu { id, actions } => {
                         if !ui.window.is_visible() {
                             ui.present();
@@ -301,10 +303,40 @@ impl Ui {
     }
 
     fn select(self: &Rc<Self>, id: &str) {
-        if let Some(text) = self.state.ui_select(id) {
-            self.window.clipboard().set_text(&text);
+        if let Some((payload, target)) = self.state.ui_select(id) {
+            self.set_clipboard(&payload, target);
         }
         self.window.set_visible(false);
+    }
+
+    fn set_clipboard(&self, payload: &ClipboardPayload, target: ClipboardTarget) {
+        match target {
+            ClipboardTarget::Clipboard => self.set_one_clipboard(&self.window.clipboard(), payload),
+            ClipboardTarget::Primary => {
+                self.set_one_clipboard(&self.window.primary_clipboard(), payload)
+            }
+            ClipboardTarget::Both => {
+                self.set_one_clipboard(&self.window.clipboard(), payload);
+                self.set_one_clipboard(&self.window.primary_clipboard(), payload);
+            }
+        }
+    }
+
+    fn set_one_clipboard(&self, clipboard: &gdk::Clipboard, payload: &ClipboardPayload) {
+        match payload {
+            ClipboardPayload::Text(text) => clipboard.set_text(text),
+            ClipboardPayload::Image { bytes, .. } => {
+                let loader = gdk_pixbuf::PixbufLoader::new();
+                if let Err(e) = loader.write(bytes).and_then(|_| loader.close()) {
+                    tracing::warn!(error = %e, "could not decode image for clipboard");
+                    return;
+                }
+                if let Some(pixbuf) = loader.pixbuf() {
+                    let texture = gdk::Texture::for_pixbuf(&pixbuf);
+                    clipboard.set_texture(&texture);
+                }
+            }
+        }
     }
 
     /// Rebuild the list from the store, filtered by `query`.
@@ -587,9 +619,19 @@ impl Ui {
             }),
         );
         general.add(&self.switch_row(
+            "Manter histórico entre reinícios",
+            cfg.general.keep_clipboard_contents,
+            |c, v| c.general.keep_clipboard_contents = v,
+        ));
+        general.add(&self.switch_row(
             "Ignorar seleção do mouse",
             cfg.general.ignore_selection,
             |c, v| c.general.ignore_selection = v,
+        ));
+        general.add(&self.switch_row(
+            "Seleção do mouse apenas em texto",
+            cfg.general.selection_text_only,
+            |c, v| c.general.selection_text_only = v,
         ));
         general.add(&self.switch_row(
             "Sincronizar seleção e área de transferência",
