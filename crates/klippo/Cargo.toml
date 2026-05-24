@@ -26,6 +26,9 @@ libadwaita = { version = "0.9.1", features = ["v1_4"] }
 async-channel = "2.5.0"
 qrcode = "0.14.1"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
+notify = "8.2.0"
+ashpd = { version = "0.13.11", default-features = false, features = ["global_shortcuts", "tokio"] }
+futures-util = { version = "0.3.32", default-features = false, features = ["std"] }
 
 # Build a .deb with: cargo install cargo-deb && cargo deb -p klippo
 [package.metadata.deb]

@@ -107,6 +107,16 @@ impl Store {
         Ok(())
     }
 
+    /// Pin or unpin an entry. Pinned entries sort above the MRU order (the
+    /// `idx_entries_order` index keys on `pinned DESC, timestamp_ms DESC`).
+    pub fn set_pinned(&self, id: &str, pinned: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE entries SET pinned = ?2 WHERE id = ?1",
+            params![id, pinned as i64],
+        )?;
+        Ok(())
+    }
+
     /// The most recent `limit` entries, newest first (pinned above all).
     pub fn list(&self, limit: u32) -> Result<Vec<Entry>> {
         let sql = format!(
@@ -278,5 +288,26 @@ mod tests {
         let list = s.list(10).unwrap();
         assert_eq!(list[0].text.as_deref(), Some("item4"));
         assert_eq!(list[1].text.as_deref(), Some("item3"));
+    }
+
+    #[test]
+    fn pinned_entries_sort_above_mru() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert(&text("a", 1), 25).unwrap();
+        s.upsert(&text("b", 2), 25).unwrap();
+        s.upsert(&text("c", 3), 25).unwrap();
+
+        // Pin the oldest; it must float above the newer, unpinned entries.
+        let a_id = text("a", 1).id;
+        s.set_pinned(&a_id, true).unwrap();
+        let list = s.list(25).unwrap();
+        assert_eq!(list[0].text.as_deref(), Some("a"), "pinned floats to top");
+        assert!(list[0].pinned);
+
+        // Unpinning returns it to MRU order (newest first).
+        s.set_pinned(&a_id, false).unwrap();
+        let list = s.list(25).unwrap();
+        assert_eq!(list[0].text.as_deref(), Some("c"));
+        assert_eq!(list[2].text.as_deref(), Some("a"));
     }
 }

@@ -35,6 +35,8 @@ struct Ui {
     search: gtk::SearchEntry,
     list: gtk::ListBox,
     scroller: gtk::ScrolledWindow,
+    /// Warns when the GNOME capture extension stops sending heartbeats.
+    banner: adw::Banner,
     /// Whether the window has been focused since the last show (so we don't
     /// auto-hide a window that opened unfocused).
     was_active: std::cell::Cell<bool>,
@@ -56,7 +58,7 @@ pub fn run(
         .build();
 
     app.connect_startup(move |app| {
-        load_css();
+        load_css(&state.font_family());
         apply_color_scheme(state.color_scheme());
         build_window(app, state.clone(), rx.clone());
     });
@@ -68,16 +70,46 @@ pub fn run(
     app.run_with_args::<&str>(&[]);
 }
 
-fn load_css() {
-    let provider = gtk::CssProvider::new();
-    provider.load_from_data(STYLE);
+thread_local! {
+    /// Provider holding the user-configured font, kept on the main thread so the
+    /// Settings dialog can hot-swap the family without rebuilding the window.
+    static FONT_PROVIDER: gtk::CssProvider = gtk::CssProvider::new();
+}
+
+/// Load the bundled base stylesheet plus a provider for the configured font.
+fn load_css(font_family: &str) {
+    let base = gtk::CssProvider::new();
+    base.load_from_data(STYLE);
+    FONT_PROVIDER.with(|fp| fp.load_from_data(&font_css(font_family)));
     if let Some(display) = gdk::Display::default() {
         gtk::style_context_add_provider_for_display(
             &display,
-            &provider,
+            &base,
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
+        // One step above the base so the configured font wins.
+        FONT_PROVIDER.with(|fp| {
+            gtk::style_context_add_provider_for_display(
+                &display,
+                fp,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+            )
+        });
     }
+}
+
+/// Hot-swap the configured font family (called from the Settings dialog).
+fn apply_font(font_family: &str) {
+    FONT_PROVIDER.with(|fp| fp.load_from_data(&font_css(font_family)));
+}
+
+/// CSS overriding the monospace previews/index with `font_family`. Quotes are
+/// stripped so a stray `"` in the value can't break out of the declaration.
+fn font_css(font_family: &str) -> String {
+    format!(
+        ".klippo-preview, .klippo-index {{ font-family: \"{}\", monospace; }}",
+        font_family.replace('"', "")
+    )
 }
 
 fn apply_color_scheme(scheme: ColorScheme) {
@@ -121,7 +153,6 @@ fn build_window(
     let scroller = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .propagate_natural_height(true)
-        .max_content_height(420)
         .child(&list)
         .build();
 
@@ -147,10 +178,17 @@ fn build_window(
     footer.append(&settings_btn);
     footer.append(&clear_btn);
 
+    // Shown only when the GNOME capture extension stops sending heartbeats.
+    let banner = adw::Banner::builder()
+        .title("Extensão do Klippo inativa — rode 'klippo setup' e refaça login.")
+        .revealed(false)
+        .build();
+
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(4)
         .build();
+    content.append(&banner);
     content.append(&search);
     content.append(&scroller);
     content.append(&footer);
@@ -162,6 +200,7 @@ fn build_window(
         search: search.clone(),
         list: list.clone(),
         scroller: scroller.clone(),
+        banner: banner.clone(),
         was_active: std::cell::Cell::new(false),
         dialog_open: std::cell::Cell::new(false),
     });
@@ -216,6 +255,14 @@ fn build_window(
             if keyval == gdk::Key::Escape {
                 ui.window.set_visible(false);
                 return glib::Propagation::Stop;
+            }
+            // Down from the search box moves into the list; arrows then navigate it.
+            if keyval == gdk::Key::Down && ui.search.has_focus() {
+                if let Some(row) = ui.list.row_at_index(0) {
+                    ui.list.select_row(Some(&row));
+                    row.grab_focus();
+                    return glib::Propagation::Stop;
+                }
             }
             if state.contains(gdk::ModifierType::ALT_MASK) {
                 if let Some(n) = keyval.to_unicode().and_then(|c| c.to_digit(10)) {
@@ -282,6 +329,13 @@ fn build_window(
                             ui.rebuild(ui.search.text().as_str());
                         }
                     }
+                    UiEvent::ConfigReloaded => {
+                        apply_color_scheme(ui.state.color_scheme());
+                        apply_font(&ui.state.font_family());
+                        if ui.window.is_visible() {
+                            ui.rebuild(ui.search.text().as_str());
+                        }
+                    }
                     UiEvent::SetClipboard { payload, target } => ui.set_clipboard(&payload, target),
                     UiEvent::ActionMenu { id, actions } => {
                         if !ui.window.is_visible() {
@@ -298,13 +352,25 @@ fn build_window(
 impl Ui {
     fn present(&self) {
         self.was_active.set(false); // re-arm focus-loss auto-hide for this show
+        self.update_extension_banner();
         self.window.present();
         self.search.grab_focus();
+    }
+
+    /// Reveal the warning banner only when the GNOME extension is the active
+    /// backend and has gone silent (no recent heartbeats).
+    fn update_extension_banner(&self) {
+        let stale = self.state.extension_status() == Some(false);
+        self.banner.set_revealed(stale);
     }
 
     fn select(self: &Rc<Self>, id: &str) {
         if let Some((payload, target)) = self.state.ui_select(id) {
             self.set_clipboard(&payload, target);
+        }
+        // Re-run an action on re-select when ReplayActionInHistory is on.
+        if let Some(replaced) = self.state.maybe_replay_action_blocking(id) {
+            self.window.clipboard().set_text(&replaced);
         }
         self.window.set_visible(false);
     }
@@ -416,7 +482,24 @@ impl Ui {
         label.add_css_class("klippo-preview");
         hbox.append(&label);
 
-        // Trailing hover-reveal buttons: [actions?] [QR] [Edit] [Delete].
+        // Pin/unpin: pinned rows sort above the MRU order and keep the pin lit.
+        let pin_btn = row_button(
+            "view-pin-symbolic",
+            if entry.pinned { "Desafixar" } else { "Fixar" },
+        );
+        if entry.pinned {
+            pin_btn.add_css_class("klippo-pinned");
+        }
+        {
+            let (ui, id, pinned) = (self.clone(), entry.id.clone(), entry.pinned);
+            pin_btn.connect_clicked(move |_| {
+                ui.state.ui_set_pinned(&id, !pinned);
+                ui.rebuild(ui.search.text().as_str());
+            });
+        }
+        hbox.append(&pin_btn);
+
+        // Trailing hover-reveal buttons: [pin] [actions?] [QR] [Edit] [Delete].
         if !self.state.matching_action_names(&entry.id).is_empty() {
             let actions_btn = row_button("system-run-symbolic", "Executar ação");
             let (ui, id) = (self.clone(), entry.id.clone());
@@ -482,6 +565,16 @@ impl Ui {
         }
         popover.set_child(Some(&vbox));
         popover.popup();
+
+        // Auto-dismiss after the configured timeout (0 = stay open).
+        let timeout_s = self.state.action_popup_timeout();
+        if timeout_s > 0 {
+            let pop = popover.clone();
+            glib::timeout_add_seconds_local(timeout_s, move || {
+                pop.popdown();
+                glib::ControlFlow::Break
+            });
+        }
     }
 
     fn open_edit(self: &Rc<Self>, id: &str) {
@@ -648,6 +741,34 @@ impl Ui {
             cfg.general.actions_enabled,
             |c, v| c.general.actions_enabled = v,
         ));
+        general.add(&self.switch_row(
+            "Ações mágicas por tipo de conteúdo",
+            cfg.general.enable_magic_mime_actions,
+            |c, v| c.general.enable_magic_mime_actions = v,
+        ));
+        general.add(&self.switch_row(
+            "Repetir ação ao reusar item",
+            cfg.general.replay_action_in_history,
+            |c, v| c.general.replay_action_in_history = v,
+        ));
+        general.add(&self.switch_row(
+            "Abrir no cursor (GNOME/X11)",
+            cfg.general.popup_at_cursor,
+            |c, v| c.general.popup_at_cursor = v,
+        ));
+
+        let timeout_row = adw::SpinRow::with_range(0.0, 60.0, 1.0);
+        timeout_row.set_title("Tempo do menu de ações (s)");
+        timeout_row.set_subtitle("0 = sem limite");
+        timeout_row.set_value(cfg.general.timeout_for_action_popups as f64);
+        {
+            let state = self.state.clone();
+            timeout_row.connect_notify_local(Some("value"), move |row, _| {
+                let v = row.value() as u32;
+                state.update_config(|c| c.general.timeout_for_action_popups = v);
+            });
+        }
+        general.add(&timeout_row);
         page.add(&general);
 
         // --- Appearance ---
@@ -674,6 +795,20 @@ impl Ui {
             });
         }
         appearance.add(&scheme_row);
+
+        let font_row = adw::EntryRow::new();
+        font_row.set_title("Fonte");
+        font_row.set_text(&cfg.ui.font_family);
+        font_row.set_show_apply_button(true);
+        {
+            let state = self.state.clone();
+            font_row.connect_apply(move |row| {
+                let family = row.text().to_string();
+                state.update_config(|c| c.ui.font_family = family.clone());
+                apply_font(&family);
+            });
+        }
+        appearance.add(&font_row);
         page.add(&appearance);
 
         win.add(&page);

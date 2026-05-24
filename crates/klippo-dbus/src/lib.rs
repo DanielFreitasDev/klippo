@@ -58,6 +58,8 @@ pub trait Daemon1 {
     fn remove_entry(&self, id: &str) -> zbus::Result<()>;
     /// Run a named action against an entry's content.
     fn run_action(&self, id: &str, action_name: &str) -> zbus::Result<()>;
+    /// Pin or unpin an entry (pinned entries stay above the MRU order).
+    fn set_pinned(&self, id: &str, pinned: bool) -> zbus::Result<()>;
     /// The newest `limit` entries, newest first.
     fn list_entries(&self, limit: u32) -> zbus::Result<Vec<DbusEntry>>;
     /// Full content of an entry as `(mime_type, bytes)`.
