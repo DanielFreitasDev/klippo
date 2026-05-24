@@ -50,4 +50,5 @@ assets = [
     # (to ~/.local/share/...), so it is not shipped to /usr/share here — that
     # avoids GNOME's "already installed ... will not be loaded" message.
     ["../../README.md", "usr/share/doc/klippo/README.md", "644"],
+    ["../../README.pt-BR.md", "usr/share/doc/klippo/README.pt-BR.md", "644"],
 ]
