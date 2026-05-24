@@ -9,10 +9,6 @@
 //! GNOME Shell extension. Writing the clipboard there is done by the focused
 //! GTK popup, so the writer is also a no-op on that path.
 
-use std::borrow::Cow;
-use std::io::Write;
-use std::process::Stdio;
-
 use anyhow::Context;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
@@ -46,13 +42,6 @@ pub trait ClipboardSource: Send {
 
     /// Human-readable backend name for logging.
     fn name(&self) -> &'static str;
-}
-
-/// Sets the system clipboard (used by `Select` on backends where the daemon
-/// owns the selection directly: X11, KDE/wlroots Wayland).
-pub trait ClipboardWriter: Send + Sync {
-    fn set_text(&self, text: &str, source: Source) -> anyhow::Result<()>;
-    fn set_image(&self, mime: &str, bytes: &[u8], source: Source) -> anyhow::Result<()>;
 }
 
 /// Which capture backend to use for the current session.
@@ -98,15 +87,6 @@ pub fn backend_capabilities(kind: BackendKind) -> BackendCapabilities {
             primary: false,
             sync_clipboards: false,
         },
-    }
-}
-
-/// Build a writer for environments where the daemon owns clipboard writes.
-pub fn writer_for_backend(kind: BackendKind) -> Box<dyn ClipboardWriter> {
-    match kind {
-        BackendKind::X11 => Box::new(X11Writer),
-        BackendKind::WaylandDataControl => Box::new(WaylandDataControlWriter),
-        BackendKind::GnomeBridge | BackendKind::None => Box::new(NullWriter),
     }
 }
 
@@ -172,95 +152,11 @@ impl ClipboardSource for NullSource {
     }
 }
 
-/// A writer that does nothing (GNOME path writes via the focused GTK popup).
-pub struct NullWriter;
-
-impl ClipboardWriter for NullWriter {
-    fn set_text(&self, _text: &str, _source: Source) -> anyhow::Result<()> {
-        Ok(())
-    }
-    fn set_image(&self, _mime: &str, _bytes: &[u8], _source: Source) -> anyhow::Result<()> {
-        Ok(())
-    }
-}
-
-/// X11 writer backed by arboard. Supports CLIPBOARD and PRIMARY.
-pub struct X11Writer;
-
-impl ClipboardWriter for X11Writer {
-    fn set_text(&self, text: &str, source: Source) -> anyhow::Result<()> {
-        use arboard::SetExtLinux;
-
-        let mut clipboard = arboard::Clipboard::new()?;
-        clipboard
-            .set()
-            .clipboard(linux_selection(source))
-            .text(text.to_string())?;
-        Ok(())
-    }
-
-    fn set_image(&self, _mime: &str, bytes: &[u8], source: Source) -> anyhow::Result<()> {
-        use arboard::{ImageData, SetExtLinux};
-
-        let image = image::load_from_memory(bytes)?.to_rgba8();
-        let (width, height) = image.dimensions();
-        let data = ImageData {
-            width: width as usize,
-            height: height as usize,
-            bytes: Cow::Owned(image.into_raw()),
-        };
-        let mut clipboard = arboard::Clipboard::new()?;
-        clipboard
-            .set()
-            .clipboard(linux_selection(source))
-            .image(data)?;
-        Ok(())
-    }
-}
-
-/// Wayland data-control writer using `wl-copy` from wl-clipboard.
-pub struct WaylandDataControlWriter;
-
-impl ClipboardWriter for WaylandDataControlWriter {
-    fn set_text(&self, text: &str, source: Source) -> anyhow::Result<()> {
-        wl_copy(source, "text/plain;charset=utf-8", text.as_bytes())
-    }
-
-    fn set_image(&self, mime: &str, bytes: &[u8], source: Source) -> anyhow::Result<()> {
-        wl_copy(source, mime, bytes)
-    }
-}
-
 fn linux_selection(source: Source) -> arboard::LinuxClipboardKind {
     match source {
         Source::Primary => arboard::LinuxClipboardKind::Primary,
         Source::Clipboard => arboard::LinuxClipboardKind::Clipboard,
     }
-}
-
-fn wl_copy(source: Source, mime: &str, bytes: &[u8]) -> anyhow::Result<()> {
-    let mut args = Vec::new();
-    if source == Source::Primary {
-        args.push("--primary".to_string());
-    }
-    args.push("--type".to_string());
-    args.push(mime.to_string());
-
-    let mut child = std::process::Command::new("wl-copy")
-        .args(&args)
-        .stdin(Stdio::piped())
-        .spawn()
-        .context("failed to start `wl-copy` (is wl-clipboard installed?)")?;
-    child
-        .stdin
-        .as_mut()
-        .context("opening wl-copy stdin")?
-        .write_all(bytes)?;
-    let status = child.wait()?;
-    if !status.success() {
-        anyhow::bail!("wl-copy exited with status {status}");
-    }
-    Ok(())
 }
 
 /// X11 clipboard monitor. Polls the CLIPBOARD selection via `arboard` on a
