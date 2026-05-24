@@ -31,15 +31,23 @@ para se integrar bem ao GNOME e a outros desktops Linux.
 - 🖱️ **Abre no cursor** e **fecha ao perder o foco** (clicar fora), no estilo
   Klipper. *(O posicionamento no cursor, no GNOME Wayland, é feito pela
   extensão — veja a tabela de suporte.)*
-- 🧰 **Botões por item** que aparecem ao passar o mouse: executar uma ação,
-  mostrar **QR code**, **editar** ou **remover** o item — além de **Limpar tudo**.
-- 🎨 **Claro/escuro** seguindo o tema do sistema, com **JetBrains Mono** embutida.
+- 📌 **Fixar** itens importantes — itens fixados ficam acima da ordem por
+  recência.
+- 🧰 **Botões por item** que aparecem ao passar o mouse: **fixar**, executar uma
+  ação, mostrar **QR code**, **editar** ou **remover** o item — além de
+  **Limpar tudo**.
+- 🎨 **Claro/escuro** seguindo o tema do sistema, com fonte configurável
+  (**JetBrains Mono** embutida).
 - ⚙️ **Janela de Configurações** — tamanho do histórico, ignorar imagens, ignorar
   seleção do mouse, sincronizar seleção↔área de transferência, evitar área vazia,
-  ativar/desativar ações, tema.
+  ativar/desativar ações, ações mágicas, repetir ação ao reusar, tempo do menu de
+  ações, abrir no cursor, fonte e tema.
 - 🤖 **Ações por regex** (como o Klipper) — casa o texto copiado e executa
   comandos com `%s` / `%0`–`%9`. **Sem shell por padrão** (à prova de injeção),
-  com menu automático opcional.
+  com menu automático opcional. **Ações mágicas** embutidas detectam URLs,
+  e-mails e caminhos de arquivo automaticamente.
+- ♻️ **Recarga de config ao vivo** — edições no `config.toml` se aplicam sem
+  reiniciar.
 
 ## Ambientes suportados
 
@@ -55,22 +63,62 @@ para se integrar bem ao GNOME e a outros desktops Linux.
 
 ## Instalação
 
-### Pelo `.deb` (Debian/Ubuntu)
+### 1. Instale o Rust e as dependências de build
+
+O Klippo precisa do **Rust 1.95+** (via [rustup](https://rustup.rs)) e das
+bibliotecas de desenvolvimento do GTK4 / libadwaita. O `wl-clipboard` só é
+necessário em sessões Wayland KDE/wlroots.
+
+**Ubuntu / Debian**
+```bash
+sudo apt install build-essential libgtk-4-dev libadwaita-1-dev wl-clipboard
+```
+
+**Fedora**
+```bash
+sudo dnf install gtk4-devel libadwaita-devel wl-clipboard
+```
+
+**Arch / Manjaro**
+```bash
+sudo pacman -S --needed base-devel gtk4 libadwaita wl-clipboard
+```
+
+Se ainda não tiver o Rust:
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+### 2. Clone e compile
 
 ```bash
-cargo install cargo-deb          # uma vez
-cargo deb -p klippo              # gera target/debian/klippo_*_amd64.deb
+git clone https://github.com/DanielFreitasDev/klippo.git
+cd klippo
+cargo build --release        # → target/release/klippo
+```
+
+### 3a. Instale via `.deb` (recomendado no Debian/Ubuntu)
+
+```bash
+cargo install cargo-deb       # uma vez
+cargo deb -p klippo           # gera target/debian/klippo_*_amd64.deb
 sudo dpkg -i target/debian/klippo_*_amd64.deb
 ```
 
 O pacote instala o binário, um serviço systemd de **usuário**, um arquivo de
 ativação D-Bus, uma entrada de autostart e a fonte JetBrains Mono embutida.
 
-### A partir do código
+### 3b. Instale manualmente (Fedora, Arch, outras)
+
+Replique o que o `.deb` faz — copie o binário e os arquivos de integração:
 
 ```bash
-sudo apt install libgtk-4-dev libadwaita-1-dev   # dependências de build
-cargo build --release                            # → target/release/klippo
+sudo install -Dm755 target/release/klippo /usr/bin/klippo
+# ativação D-Bus (inicia o daemon no primeiro `klippo toggle`):
+sudo install -Dm644 data/org.klippo.Daemon.service \
+  /usr/share/dbus-1/services/org.klippo.Daemon.service
+# autostart do daemon no login:
+sudo install -Dm644 data/klippo.desktop /etc/xdg/autostart/klippo.desktop
 ```
 
 ## Configuração inicial (GNOME)
@@ -97,7 +145,7 @@ atalho a `klippo toggle` nas configurações do desktop/WM e garantir que o
 | Abrir / fechar o popup | **Super+V** (ou `klippo toggle`) |
 | Filtrar | comece a digitar |
 | Escolher um item | clique, **Enter** (primeiro resultado) ou **Alt+1…9** |
-| Ação / QR / editar / remover (por item) | passe o mouse na linha |
+| Fixar / ação / QR / editar / remover (por item) | passe o mouse na linha |
 | Limpar tudo · Configurações | botões no rodapé |
 | Dispensar | **Esc** ou clicar fora |
 
@@ -109,18 +157,23 @@ Klipper.
 
 A configuração fica em `~/.config/klippo/config.toml` (criada com padrões à la
 Klipper na primeira execução); o histórico fica em
-`~/.local/share/klippo/history.db`.
+`~/.local/share/klippo/history.db`. O daemon observa o arquivo e **recarrega as
+mudanças ao vivo**.
 
 ```toml
 [general]
 max_items = 25
 keep_clipboard_contents = true
 ignore_images = true
-ignore_selection = true          # não captura seleções do mouse (PRIMARY)
-selection_text_only = true       # seleções PRIMARY só armazenam texto
+ignore_selection = true            # não captura seleções do mouse (PRIMARY)
+selection_text_only = true         # seleções PRIMARY só armazenam texto
 sync_clipboards = false
 prevent_empty_clipboard = true
 actions_enabled = true
+enable_magic_mime_actions = true   # sugere ações para URLs / e-mails / arquivos
+replay_action_in_history = false   # repete a ação ao reselecionar um item
+timeout_for_action_popups = 8      # fecha o menu de ações após N s (0 = nunca)
+popup_at_cursor = false            # abre no cursor (GNOME via extensão / X11)
 
 [ui]
 color_scheme = "system"          # system | light | dark
@@ -159,8 +212,8 @@ X11 / KDE / wlroots ── captura direta ───►  klippo-core (daemon)
   TOML, Ações por regex. Sem GUI/D-Bus; com testes unitários.
 - **`klippo-dbus`** — interfaces zbus compartilhadas: `Daemon1`
   (controle/consulta) e `Capture1` (recepção de capturas).
-- **`klippo-capture`** — traits `ClipboardSource`/`ClipboardWriter`, detecção de
-  ambiente e os backends X11 / Wayland-data-control / ponte-GNOME.
+- **`klippo-capture`** — a trait `ClipboardSource`, detecção de ambiente e os
+  backends X11 / Wayland-data-control / ponte-GNOME.
 - **`klippo`** — o binário: daemon, popup GTK4, CLI e o `setup` do GNOME.
 - **`extension/`** — a ponte do GNOME Shell (captura + posicionamento no cursor).
 

@@ -1,6 +1,6 @@
 [Unit]
 Description=Klippo clipboard history daemon
-Documentation=https://github.com/klippo/klippo
+Documentation=https://github.com/DanielFreitasDev/klippo
 PartOf=graphical-session.target
 After=graphical-session.target
 

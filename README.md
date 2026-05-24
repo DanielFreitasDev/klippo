@@ -30,14 +30,19 @@ to feel at home on GNOME and other Linux desktops.
 - 🖱️ **Opens at the cursor** and **closes when it loses focus** (click outside),
   Klipper-style. *(Cursor placement on GNOME Wayland is performed by the
   extension — see the support table.)*
-- 🧰 **Per-item buttons** revealed on hover: run a matching action, show a
-  **QR code**, **edit** the entry, or **delete** it — plus **Clear all**.
-- 🎨 **Light/dark** following the system theme, with **JetBrains Mono** bundled.
+- 📌 **Pin** important entries — pinned items stay above the most-recent order.
+- 🧰 **Per-item buttons** revealed on hover: **pin**, run a matching action, show
+  a **QR code**, **edit** the entry, or **delete** it — plus **Clear all**.
+- 🎨 **Light/dark** following the system theme, with a configurable font
+  (**JetBrains Mono** bundled).
 - ⚙️ **Settings dialog** — history size, ignore images, ignore mouse selection,
-  sync selection↔clipboard, prevent empty clipboard, actions on/off, theme.
+  sync selection↔clipboard, prevent empty clipboard, actions on/off, magic
+  actions, replay-on-reuse, action-menu timeout, open-at-cursor, font and theme.
 - 🤖 **Regex Actions** (like Klipper) — match clipboard text and run commands
   with `%s` / `%0`–`%9` placeholders. **Shell-free by default** (injection-safe),
-  with an optional auto-popup menu.
+  with an optional auto-popup menu. Built-in **magic actions** detect URLs,
+  e-mails and file paths automatically.
+- ♻️ **Live config reload** — edits to `config.toml` apply without a restart.
 
 ## Supported environments
 
@@ -53,22 +58,62 @@ to feel at home on GNOME and other Linux desktops.
 
 ## Install
 
-### From the `.deb` (Debian/Ubuntu)
+### 1. Install Rust and the build dependencies
+
+Klippo needs **Rust 1.95+** (via [rustup](https://rustup.rs)) and the GTK4 /
+libadwaita development libraries. `wl-clipboard` is only needed on KDE/wlroots
+Wayland sessions.
+
+**Ubuntu / Debian**
+```bash
+sudo apt install build-essential libgtk-4-dev libadwaita-1-dev wl-clipboard
+```
+
+**Fedora**
+```bash
+sudo dnf install gtk4-devel libadwaita-devel wl-clipboard
+```
+
+**Arch / Manjaro**
+```bash
+sudo pacman -S --needed base-devel gtk4 libadwaita wl-clipboard
+```
+
+If you don't have Rust yet:
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+### 2. Clone and build
 
 ```bash
-cargo install cargo-deb          # once
-cargo deb -p klippo              # builds target/debian/klippo_*_amd64.deb
+git clone https://github.com/DanielFreitasDev/klippo.git
+cd klippo
+cargo build --release        # → target/release/klippo
+```
+
+### 3a. Install via `.deb` (Debian/Ubuntu — recommended there)
+
+```bash
+cargo install cargo-deb       # once
+cargo deb -p klippo           # builds target/debian/klippo_*_amd64.deb
 sudo dpkg -i target/debian/klippo_*_amd64.deb
 ```
 
 The package installs the binary, a systemd **user** service, a D-Bus activation
 file, an autostart entry, and the bundled JetBrains Mono font.
 
-### From source
+### 3b. Install manually (Fedora, Arch, others)
+
+Replicate what the `.deb` does — copy the binary and the integration files:
 
 ```bash
-sudo apt install libgtk-4-dev libadwaita-1-dev   # build dependencies
-cargo build --release                            # → target/release/klippo
+sudo install -Dm755 target/release/klippo /usr/bin/klippo
+# D-Bus activation (auto-starts the daemon on the first `klippo toggle`):
+sudo install -Dm644 data/org.klippo.Daemon.service \
+  /usr/share/dbus-1/services/org.klippo.Daemon.service
+# autostart the daemon at login:
+sudo install -Dm644 data/klippo.desktop /etc/xdg/autostart/klippo.desktop
 ```
 
 ## First-time setup (GNOME)
@@ -95,7 +140,7 @@ at login (the `.deb` autostarts it).
 | Open / close the popup | **Super+V** (or `klippo toggle`) |
 | Filter | start typing |
 | Pick an item | click, **Enter** (top match), or **Alt+1…9** |
-| Per-item action / QR / edit / delete | hover the row |
+| Pin / action / QR / edit / delete (per item) | hover the row |
 | Clear all · Settings | footer buttons |
 | Dismiss | **Esc** or click outside |
 
@@ -106,17 +151,22 @@ Selecting an item copies its content (text or image) to the clipboard (it does
 
 Config lives at `~/.config/klippo/config.toml` (created with Klipper-like
 defaults on first run); history is stored at `~/.local/share/klippo/history.db`.
+The daemon watches the file and **reloads changes live**.
 
 ```toml
 [general]
 max_items = 25
 keep_clipboard_contents = true
 ignore_images = true
-ignore_selection = true          # don't capture mouse (PRIMARY) selections
-selection_text_only = true       # PRIMARY selections only store text
+ignore_selection = true            # don't capture mouse (PRIMARY) selections
+selection_text_only = true         # PRIMARY selections only store text
 sync_clipboards = false
 prevent_empty_clipboard = true
 actions_enabled = true
+enable_magic_mime_actions = true   # suggest actions for URLs / e-mails / files
+replay_action_in_history = false   # re-run the action when re-selecting an item
+timeout_for_action_popups = 8      # auto-close the action menu after N s (0 = never)
+popup_at_cursor = false            # open at the pointer (GNOME via extension / X11)
 
 [ui]
 color_scheme = "system"          # system | light | dark
@@ -155,8 +205,8 @@ X11 / KDE / wlroots ── direct capture ───►  klippo-core (daemon)
   config, regex Actions. No GUI/D-Bus; unit-tested.
 - **`klippo-dbus`** — shared zbus interfaces: `Daemon1` (control/query) and
   `Capture1` (capture push).
-- **`klippo-capture`** — `ClipboardSource`/`ClipboardWriter` traits, environment
-  detection, and the X11 / Wayland-data-control / GNOME-bridge backends.
+- **`klippo-capture`** — the `ClipboardSource` trait, environment detection, and
+  the X11 / Wayland-data-control / GNOME-bridge backends.
 - **`klippo`** — the binary: daemon, GTK4 popup, CLI, and the GNOME `setup`.
 - **`extension/`** — the GNOME Shell bridge (capture + cursor placement).
 
